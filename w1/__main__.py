@@ -122,9 +122,9 @@ try:
 
                     # ლამაზი ყვითელი ყუთი + ქართული წარწერა
                     cv2.rectangle(frame_copy, (gx1, gy1), (gx2, gy2), (0, 255, 255), 4)
-                    cv2.putText(frame_copy, f"მატარებელი {conf:.2f}", (gx1, gy1 - 15),
+                    cv2.putText(frame_copy, f"train{conf:.2f}", (gx1, gy1 - 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5)
-                    cv2.putText(frame_copy, f"მატარებელი {conf:.2f}", (gx1, gy1 - 15),
+                    cv2.putText(frame_copy, f"train {conf:.2f}", (gx1, gy1 - 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
 
         # LIVE + FPS
