@@ -19,7 +19,6 @@ pip install -r requirements.txt
 
 pyinstaller --onefile -n w1  w1\__main__.py
 
-pyinstaller --onefile -n w1  w1\__main__.py
 
 pyinstaller --onefile --icon=icon.ico -n m2 w1\__main__.py
 
