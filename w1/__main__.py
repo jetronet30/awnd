@@ -1,527 +1,347 @@
+#!/usr/bin/env python3
 import cv2
-import subprocess
 import os
 import threading
 import time
 import signal
 import sys
+import json
 import torch
-import re
 import numpy as np
 from datetime import datetime
 from ultralytics import YOLO
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from PIL import Image
 import queue
-
-# **სრული GUI კონტროლი + WAGON OCR**
-cv2.setNumThreads(1)
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "0"
-os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF_ENABLE_OPENEXR"] = "0"
-os.environ["OPENCV_SHOW_IMAGES"] = "0"
+import socket
+from threading import Thread
 
 # ================================
 # კონფიგურაცია
 # ================================
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "hls_output")
-HLS_PLAYLIST = os.path.join(OUTPUT_DIR, "index.m3u8")
 RTSP_URL = "rtsp://admin:admin@192.168.1.11:554"
-SEGMENT_DURATION = 5
 MODEL_PATH = "best.pt"
-LOG_FILE = os.path.join(os.path.dirname(__file__), "wagon_ocr_results.txt")
 
-# **WAGON OCR კონფიგი (ოპტიმიზებული)**
-MIN_CONFIDENCE_OCR = 0.83
-MATCH_THRESHOLD = 180
-MIN_CONFIDENCE_FOR_ID = 0.85
+UNIQUE_WAGON_JSON = "unique_wagons.json"
+ALL_OCR_JSON = "all_ocr_results.json"
 
-FIXED_WINDOW_WIDTH = 1280
-FIXED_WINDOW_HEIGHT = 720
+MIN_CONFIDENCE_OCR = 0.6
+TCP_SERVER_IP = "127.0.0.1"
+TCP_SERVER_PORT = 5000
+TCP_RECONNECT_DELAY = 5
+WAGON_NUMBER_LENGTH = 8
 
-LEFT_MARGIN   = 0.20    
-RIGHT_MARGIN  = 0.20    
-TOP_MARGIN    = 0.20    
-BOTTOM_MARGIN = 0.20    
-
-# **გლობალური ცვლადები (ოპტიმიზებული)**
-frame_queue = queue.Queue(maxsize=10)
-crop_queue = queue.Queue(maxsize=12)
-ffmpeg_process = None
+# ================================
+# გლობალური ცვლადები
+# ================================
+crop_queue = queue.Queue(maxsize=2)
+command_queue = queue.Queue()
 running = True
+
 model = None
 cap = None
-last_ocr_text = "wagon: -"
+tcp_socket = None
 ocr_lock = threading.Lock()
-known_sectors = {}
-next_id = 1
 
-def get_center(box):
-    x1, y1, x2, y2 = box
-    return ((x1 + x2) // 2, (y1 + y2) // 2)
+last_boxes = {}
+cached_wagons = {}
+wagon_numbers = {}
+unique_numbers = set()
 
-def get_stable_id(current_center, confidence):
-    global next_id
-    if confidence < MIN_CONFIDENCE_FOR_ID:
-        return None
-    best_id = None
-    best_distance = float('inf')
-    for sid, known_center in known_sectors.items():
-        dist = ((current_center[0] - known_center[0])**2 +
-                (current_center[1] - known_center[1])**2)**0.5
-        if dist < best_distance and dist < MATCH_THRESHOLD:
-            best_distance = dist
-            best_id = sid
-    if best_id is not None:
-        known_sectors[best_id] = current_center
-        return best_id
-    else:
-        new_id = next_id
-        known_sectors[new_id] = current_center
-        next_id += 1
-        return new_id
+display_id_counter = 1
+track_to_display_id = {}
 
-# **OCR Worker Thread (ოპტიმიზებული სიჩქარისთვის)**
-def ocr_worker():
-    global last_ocr_text, running
+wagons_data = {
+    "session": {"start_time": datetime.now().isoformat(), "total_wagons": 0, "unique_numbers": 0},
+    "wagons": [],
+    "ocr_results": []
+}
+
+frame_count = 0
+g_conf = "0.000"
+
+# ================================
+# JSON ლოგირება
+# ================================
+def log_unique(track_id, number):
+    global display_id_counter
+    if track_id not in track_to_display_id:
+        track_to_display_id[track_id] = display_id_counter
+        display_id_counter += 1
     
-    print("[INFO] TrOCR მოდელი იტვირთება...")
+    display_id = track_to_display_id[track_id]
+    
+    wagons_data["wagons"].append({
+        "id": display_id,
+        "number": number
+    })
+    wagons_data["session"]["unique_numbers"] += 1
+    
+    print(f"ახალი უნიკალური: {display_id}-->{number}")
+
+def save_logs():
+    simple_list = wagons_data["wagons"]
+    with open(UNIQUE_WAGON_JSON, "w", encoding="utf-8") as f:
+        json.dump(simple_list, f, ensure_ascii=False, indent=2)
+
+# ================================
+# OCR Worker
+# ================================
+def ocr_worker():
     processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
     trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
-    trocr_model.to("cpu")
     trocr_model.eval()
-    torch.set_grad_enabled(False)
-    
-    # TXT ლოგის ინიციალიზაცია
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write("\n=== HLS + WAGON OCR: ახალი სესია " + "="*50 + "\n")
-    
+
     while running:
         try:
-            item = crop_queue.get(timeout=0.3)
-            if item is None:
+            cropped, track_id = crop_queue.get(timeout=0.3)
+            if cropped is None:
                 break
-            cropped_img, wagon_id = item
 
-            pil_img = Image.fromarray(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB))
-            pil_img = pil_img.resize((384, 96), Image.BILINEAR)
-            pixel_values = processor(pil_img, return_tensors="pt").pixel_values
+            pil = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)).resize((224, 56), Image.BILINEAR)
+            pixel_values = processor(pil, return_tensors="pt").pixel_values
 
             with torch.no_grad():
-                generated_ids = trocr_model.generate(
-                    pixel_values,
-                    max_length=12,
-                    num_beams=1,
-                    early_stopping=True
-                )
-            text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                ids = trocr_model.generate(pixel_values, max_length=12, num_beams=1)
+            text = processor.batch_decode(ids, skip_special_tokens=True)[0]
+            cleaned = ''.join(filter(str.isdigit, text))
 
-            cleaned = re.sub(r'[^\d]', '', text
-                             .replace('O', '0').replace('o', '0')
-                             .replace('I', '1').replace('l', '1')
-                             .replace('S', '5').replace('B', '8'))
+            valid = len(cleaned) == WAGON_NUMBER_LENGTH
 
-            if len(cleaned) >= 4:
-                result = f"wagon-{wagon_id}: {cleaned}"
-                with ocr_lock:
-                    last_ocr_text = result
-                if running:
-                    print(f"[OCR] {result}")
-
-                    with open(LOG_FILE, "a", encoding="utf-8") as logf:
-                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                        logf.write(f"[{timestamp}] {result}\n")
+            if valid and cleaned not in unique_numbers and track_id not in wagon_numbers:
+                unique_numbers.add(cleaned)
+                wagon_numbers[track_id] = cleaned
+                log_unique(track_id, cleaned)
 
         except queue.Empty:
             continue
         except Exception as e:
             if running:
-                print(f"[OCR შეცდომა] {e}")
+                print(f"OCR Error: {e}")
 
-# **OCR თრედის გაშვება**
-ocr_thread = threading.Thread(target=ocr_worker, daemon=False)
-ocr_thread.start()
-
-def signal_handler(sig, frame):
-    global running
-    print("\n⏹️ გაჩერდა Ctrl+C-ით...")
-    running = False
-    sys.exit(0)
-
-def cleanup_hls():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    for f in os.listdir(OUTPUT_DIR):
-        fp = os.path.join(OUTPUT_DIR, f)
-        try:
-            if os.path.isfile(fp) and (f.endswith(".ts") or f == "index.m3u8"):
-                os.remove(fp)
-        except:
-            pass
-
-def start_ffmpeg(width, height, fps):
-    global ffmpeg_process
-    cleanup_hls()
-    
-    ffmpeg_cmd = [
-        "ffmpeg", "-re", "-y",
-        "-f", "rawvideo", 
-        "-vcodec", "rawvideo", 
-        "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", 
-        "-r", str(fps), 
-        "-i", "-",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-tune", "zerolatency",
-        "-g", str(int(fps) * 2),
-        "-sc_threshold", "0",
-        "-f", "hls",
-        "-hls_time", str(SEGMENT_DURATION),
-        "-hls_list_size", "10",
-        "-hls_flags", "delete_segments+append_list+program_date_time+independent_segments",
-        "-hls_segment_filename", os.path.join(OUTPUT_DIR, "segment_%03d.ts"),
-        HLS_PLAYLIST
-    ]
-    
-    try:
-        ffmpeg_process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            bufsize=10**8,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        )
-        print("✅ FFmpeg გაშვებულია")
-        return True
-    except Exception as e:
-        print(f"❌ FFmpeg შეცდომა: {e}")
-        return False
-
-def rtsp_reader_thread():
-    global cap, running
-    
+# ================================
+# TCP + სესია
+# ================================
+def tcp_client_thread():
+    global running, tcp_socket
     while running:
         try:
-            if cap is None or not cap.isOpened():
-                cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_FPS, 25)
-                
-            ret, frame = cap.read()
-            if ret and frame_queue.qsize() < 8:
-                frame_queue.put(frame, block=False)
-            elif not ret:
-                if cap:
-                    cap.release()
-                cap = None
-                time.sleep(1)
-                
-        except:
-            if cap:
-                cap.release()
-            cap = None
+            tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            print(f"ვუკავშირდებით {TCP_SERVER_IP}:{TCP_SERVER_PORT}...")
+            tcp_socket.connect((TCP_SERVER_IP, TCP_SERVER_PORT))
+            print("TCP დაკავშირებულია!")
+            while running:
+                data = tcp_socket.recv(1024)
+                if not data:
+                    break
+                cmd = data.decode('utf-8').strip().upper()
+                if cmd in ["START", "STOP"]:
+                    command_queue.put(cmd)
+        except Exception as e:
+            if running:
+                print(f"TCP შეცდომა: {e}")
+        finally:
+            if tcp_socket:
+                tcp_socket.close()
+                tcp_socket = None
+        if running:
+            time.sleep(TCP_RECONNECT_DELAY)
+
+def reset_session():
+    global display_id_counter, track_to_display_id
+    with ocr_lock:
+        last_boxes.clear()
+        cached_wagons.clear()
+        wagon_numbers.clear()
+        unique_numbers.clear()
+        display_id_counter = 1
+        track_to_display_id.clear()
+        wagons_data["wagons"] = []
+        wagons_data["ocr_results"] = []
+        wagons_data["session"] = {
+            "start_time": datetime.now().isoformat(),
+            "total_wagons": 0,
+            "unique_numbers": 0
+        }
+    print("სესია გადატვირთულია! (START) — ყველაფერი გასუფთავდა.")
+
+def handle_stop_command():
+    print("STOP ბრძანება მიღებული — ვაგზავნით შედეგებს სერვერზე...")
+    save_logs()
+
+    # მომზადება სუფთა JSON-ის გაგზავნისთვის
+    wagons_list = wagons_data["wagons"]  # [{"id": 1, "number": "76724913"}, ...]
+
+    if not wagons_list:
+        print("არ არის ვაგონები გასაგზავნად.")
+        return
+
+    json_data = json.dumps(wagons_list, ensure_ascii=False)
+    data_bytes = json_data.encode('utf-8')
+
+    try:
+        send_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        send_sock.settimeout(10)
+        send_sock.connect((TCP_SERVER_IP, TCP_SERVER_PORT))
+        
+        # გაგზავნა: 8-ნიშნა სიგრძე + JSON
+        length_prefix = f"{len(data_bytes):08d}".encode('utf-8')
+        send_sock.sendall(length_prefix + data_bytes)
+        
+        print(f"JSON წარმატებით გაიგზავნა სერვერზე! ({len(wagons_list)} ვაგონი, {len(data_bytes)} ბაიტი)")
+        send_sock.close()
+    except Exception as e:
+        print(f"JSON-ის გაგზავნა ვერ მოხერხდა: {e}")
+
+# ================================
+# მთავარი ციკლი
+# ================================
+def main():
+    global running, model, cap, frame_count, g_conf
+
+    signal.signal(signal.SIGINT, lambda s, f: cleanup())
+    signal.signal(signal.SIGTERM, lambda s, f: cleanup())
+
+    Thread(target=tcp_client_thread, daemon=True).start()
+    Thread(target=ocr_worker, daemon=True).start()
+
+    model = YOLO(MODEL_PATH)
+    model.fuse()
+
+    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if width == 0:
+        print("კამერა არ მუშაობს!")
+        return
+
+    roi = (int(width*0.10), int(width*0.90), int(height*0.20), int(height*0.80))
+    rx1_roi, rx2_roi, ry1_roi, ry2_roi = roi
+
+    cv2.namedWindow("WAGON TRACKER - UNIQUE NUMBERS", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("WAGON TRACKER - UNIQUE NUMBERS", 1280, 720)
+
+    while running:
+        try:
+            while True:
+                cmd = command_queue.get_nowait()
+                if cmd == "START":
+                    reset_session()
+                elif cmd == "STOP":
+                    handle_stop_command()
+        except queue.Empty:
+            pass
+
+        ret, frame = cap.read()
+        if not ret:
             time.sleep(1)
+            cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+            continue
+
+        scale = min(1280/width, 720/height)
+        disp = cv2.resize(frame, (int(width*scale), int(height*scale)))
+        bg = np.zeros((720, 1280, 3), np.uint8)
+        offset_y = (720 - disp.shape[0]) // 2
+        offset_x = (1280 - disp.shape[1]) // 2
+        bg[offset_y:offset_y+disp.shape[0], offset_x:offset_x+disp.shape[1]] = disp
+        disp = bg
+
+        frame_count += 1
+
+        cv2.rectangle(disp,
+            (int(rx1_roi*scale)+offset_x, int(ry1_roi*scale)+offset_y),
+            (int(rx2_roi*scale)+offset_x, int(ry2_roi*scale)+offset_y),
+            (0, 0, 255), 2)
+
+        best_box = None
+        best_conf = 0
+        best_id = None
+
+        if frame_count % 3 == 0:
+            roi_frame = frame[ry1_roi:ry2_roi, rx1_roi:rx2_roi]
+
+            results = model.track(
+                source=roi_frame,
+                conf=0.25,
+                iou=0.6,
+                imgsz=640,
+                tracker="botsort.yaml",
+                persist=True,
+                verbose=False
+            )[0]
+
+            for box in results.boxes:
+                if box.id is None:
+                    continue
+                track_id = int(box.id.item())
+                conf = box.conf.item()
+                g_conf = f"{conf:.3f}"
+
+                bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                gx1 = rx1_roi + bx1
+                gy1 = ry1_roi + by1
+                gx2 = rx1_roi + bx2
+                gy2 = ry1_roi + by2
+
+                last_boxes[track_id] = (gx1, gy1, gx2, gy2)
+                cached_wagons[track_id] = frame_count
+
+                if conf > best_conf and conf >= MIN_CONFIDENCE_OCR:
+                    best_conf = conf
+                    best_box = (gx1, gy1, gx2, gy2)
+                    best_id = track_id
+
+            for tid in list(cached_wagons):
+                if frame_count - cached_wagons[tid] > 45:
+                    cached_wagons.pop(tid, None)
+                    last_boxes.pop(tid, None)
+
+        if best_box and frame_count % 12 == 0:
+            x1, y1, x2, y2 = best_box
+            crop = frame[y1:y2, x1:x2]
+            if crop.size > 0 and crop_queue.qsize() < 2:
+                crop_queue.put((crop.copy(), best_id))
+
+        for track_id, (x1, y1, x2, y2) in last_boxes.items():
+            if track_id not in cached_wagons:
+                continue
+
+            display_id = track_to_display_id.get(track_id, "?")
+            dx1 = int(x1 * scale) + offset_x
+            dy1 = int(y1 * scale) + offset_y
+            dx2 = int(x2 * scale) + offset_x
+            dy2 = int(y2 * scale) + offset_y
+
+            color = (0, 165, 255)
+            if track_id in wagon_numbers:
+                color = (0, 255, 0)
+            elif best_id == track_id:
+                color = (0, 255, 255)
+
+            cv2.rectangle(disp, (dx1, dy1), (dx2, dy2), color, 3)
+            label = f"{display_id}-->{wagon_numbers.get(track_id, '?')}"
+            cv2.putText(disp, label, (dx1, dy1 - 8), cv2.FONT_HERSHEY_DUPLEX, 0.9, color, 2)
+
+        cv2.putText(disp, f"Conf: {g_conf}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2)
+        cv2.putText(disp, f"Unique: {wagons_data['session']['unique_numbers']}", (20, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 255, 0), 3)
+
+        cv2.imshow("WAGON TRACKER - UNIQUE NUMBERS", disp)
+        if cv2.waitKey(1) == 27:
+            break
+
+    cleanup()
 
 def cleanup():
-    global running, ffmpeg_process, cap
-    
+    global running
+    print("\nპროგრამა მთავრდება...")
     running = False
-    
-    # OCR queue cleanup
-    try:
-        crop_queue.put_nowait(None)
-    except:
-        pass
-    
-    # ყველა cleanup
-    for i in range(10):
-        cv2.destroyAllWindows()
-        cv2.waitKey(10)
-        time.sleep(0.01)
-    
+    time.sleep(1)
     if cap:
         cap.release()
-        cap = None
-        
-    if ffmpeg_process:
-        try:
-            if ffmpeg_process.stdin and not ffmpeg_process.stdin.closed:
-                ffmpeg_process.stdin.close()
-            ffmpeg_process.terminate()
-            ffmpeg_process.wait(timeout=3)
-        except:
-            try:
-                ffmpeg_process.kill()
-            except:
-                pass
-    
-    # OCR თრედის შეჩერება
-    ocr_thread.join(timeout=3)
-    
-    print(f"\n✅ **დასრულდა!**")
-    print(f"📺 HLS: {HLS_PLAYLIST.replace(chr(92), '/')}")
-    print(f"💾 Wagon ლოგი: {LOG_FILE}")
-    print(f"🔢 სულ ინდექსირებული wagon: {next_id-1}")
-    sys.exit(0)
-
-def main_loop():
-    global running, model, cap, width, height
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    # YOLO მოდელი
-    try:
-        model = YOLO(MODEL_PATH)
-        model.overrides['show'] = False
-        model.overrides['save'] = False
-        model.overrides['visualize'] = False
-        print(f"✅ YOLO + OCR ჩაიტვირთა!")
-    except Exception as e:
-        print(f"❌ YOLO შეცდომა: {e}")
-        return
-    
-    # RTSP ტესტი
-    test_cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-    test_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    width = int(test_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = test_cap.get(cv2.CAP_PROP_FPS) or 25
-    test_cap.release()
-    
-    if width == 0 or height == 0:
-        print("❌ კამერა ვერ გაიხსნა!")
-        return
-    
-    if not start_ffmpeg(width, height, fps):
-        return
-    
-    # ROI
-    x1 = int(width * LEFT_MARGIN)
-    x2 = int(width * (1 - RIGHT_MARGIN))
-    y1 = int(height * TOP_MARGIN)
-    y2 = int(height * (1 - BOTTOM_MARGIN))
-    
-    print(f"\n🚂 **WAGON OCR + HLS STREAM (⚡ FPS ოპტიმიზებული)**")
-    print(f"📺 რეზოლუცია: {width}x{height}")
-    print(f"🎯 TRAIN ზონა: ({x1},{y1},{x2},{y2})")
-    print(f"💾 OCR ლოგი: {LOG_FILE}")
-    print(f"📡 HLS: {HLS_PLAYLIST.replace(chr(92), '/')}")
-    
-    # RTSP თრედი
-    rtsp_thread = threading.Thread(target=rtsp_reader_thread, daemon=True)
-    rtsp_thread.start()
-    time.sleep(2)
-    
-    # ფანჯარა
-    window_name = "🚂 WAGON OCR + HLS LIVE ⚡"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, FIXED_WINDOW_WIDTH, FIXED_WINDOW_HEIGHT)
-    cv2.moveWindow(window_name, 50, 30)
-    cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
-    
-    # 🔥 **FPS ოპტიმიზაციის ცვლადები**
-    frame_count = 0
-    last_fps_time = time.time()
-    current_fps = fps
-    best_conf_local = 0.0
-    best_id_local = 0
-    yolo_frame_skip = 0      # YOLO ყოველ 3 ფრეიმზე
-    ffmpeg_skip = 0          # FFmpeg ყოველ 2 ფრეიმზე
-    ocr_frame_count = 0      # OCR ყოველ 20 ფრეიმზე
-    
-    # **ძველი detection-ის კეში** (სტაბილურობისთვის)
-    cached_boxes = []
-    
-    print("🎬 **დაიწყო WAGON ნომრის ამოღება!**")
-    print("⏹️ **გაჩერება:** 'q' ან Ctrl+C")
-    print("⚡ **YOLO: ყოველ 3 ფრეიმზე | FFmpeg: ყოველ 2 ფრეიმზე**")
-    
-    try:
-        while running:
-            try:
-                frame = frame_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-                
-            # **YOLO SKIP LOGIC**
-            yolo_frame_skip += 1
-            do_yolo = (yolo_frame_skip % 3 == 0)
-            ffmpeg_skip += 1
-            do_ffmpeg = (ffmpeg_skip % 2 == 0)
-            ocr_frame_count += 1
-            
-            # რეზიზი და display_frame
-            scale_w = FIXED_WINDOW_WIDTH / width
-            scale_h = FIXED_WINDOW_HEIGHT / height
-            scale = min(scale_w, scale_h)
-            
-            new_w = int(width * scale)
-            new_h = int(height * scale)
-            frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            
-            display_frame = np.zeros((FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, 3), dtype=np.uint8)
-            x_offset = (FIXED_WINDOW_WIDTH - new_w) // 2
-            y_offset = (FIXED_WINDOW_HEIGHT - new_h) // 2
-            display_frame[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = frame_resized
-            
-            frame_copy = display_frame.copy()
-            
-            # ROI (მხოლოდ ჩრდილი)
-            roi_x1 = int(x1 * scale) + x_offset
-            roi_y1 = int(y1 * scale) + y_offset
-            roi_x2 = int(x2 * scale) + x_offset
-            roi_y2 = int(y2 * scale) + y_offset
-            cv2.rectangle(frame_copy, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 0, 255), 2)
-            
-            # **WAGON DETECTION მხოლოდ ყოველ 3 ფრეიმზე**
-            roi_frame = frame[y1:y2, x1:x2]
-            best_sector = None
-            best_conf_local = 0.0
-            best_id_local = 0
-            
-            if do_yolo and roi_frame.size > 0 and model:
-                try:
-                    results = model(roi_frame, verbose=False, conf=0.3, show=False)[0]
-                    cached_boxes = []  # ყოველ YOLO-ს შემდეგ განახლება
-                    
-                    for box in results.boxes:
-                        rx1, ry1, rx2, ry2 = map(int, box.xyxy[0])
-                        conf = box.conf.item()
-                        
-                        # გლობალური კოორდინატები
-                        gx1, gy1 = x1 + rx1, y1 + ry1
-                        gx2, gy2 = x1 + rx2, y1 + ry2
-                        
-                        # ცენტრი და ID
-                        center = get_center((gx1, gy1, gx2, gy2))
-                        wagon_id = get_stable_id(center, conf)
-                        
-                        # კეში შენახვა
-                        cached_boxes.append((gx1, gy1, gx2, gy2, conf, wagon_id))
-                        
-                        # საუკეთესო wagon OCR-სთვის
-                        if conf > best_conf_local and conf >= MIN_CONFIDENCE_OCR and wagon_id:
-                            best_conf_local = conf
-                            best_sector = (gx1, gy1, gx2, gy2)
-                            best_id_local = wagon_id
-                            
-                except Exception as e:
-                    pass
-            
-            # **ძველი BOX-ების გამოტანა** (სტაბილურობისთვის)
-            for gx1, gy1, gx2, gy2, conf, wagon_id in cached_boxes:
-                display_gx1 = int(gx1 * scale) + x_offset
-                display_gy1 = int(gy1 * scale) + y_offset
-                display_gx2 = int(gx2 * scale) + x_offset
-                display_gy2 = int(gy2 * scale) + y_offset
-                
-                if conf >= MIN_CONFIDENCE_OCR:
-                    color = (0, 255, 0)
-                    label = f"W{wagon_id}"
-                else:
-                    color = (0, 120, 255)
-                    label = ""
-                
-                cv2.rectangle(frame_copy, (display_gx1, display_gy1), 
-                            (display_gx2, display_gy2), color, 3)
-                if label:
-                    cv2.putText(frame_copy, label, (display_gx1, display_gy1 - 10),
-                               cv2.FONT_HERSHEY_DUPLEX, 1.2, color, 2)
-            
-            # **OCR ყოველ 20 ფრეიმზე**
-            if best_sector and ocr_frame_count % 20 == 0:
-                bx1, by1, bx2, by2 = best_sector
-                cropped = frame[by1:by2, bx1:bx2]
-                try:
-                    if crop_queue.qsize() >= 10:
-                        try:
-                            crop_queue.get_nowait()
-                        except:
-                            pass
-                    crop_queue.put_nowait((cropped.copy(), best_id_local))
-                except queue.Full:
-                    pass
-            
-            # *** GUI ტექსტები ***
-            with ocr_lock:
-                current_ocr_text = last_ocr_text
-            
-            frame_count += 1
-            if time.time() - last_fps_time > 1.0:
-                current_fps = frame_count / (time.time() - last_fps_time)
-                last_fps_time = time.time()
-                frame_count = 0
-            
-            # 1. FPS
-            cv2.putText(frame_copy, f"FPS: {current_fps:.1f}", 
-                       (FIXED_WINDOW_WIDTH - 150, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            
-            # 2. YOLO სტატუსი
-            yolo_status = "ON" if do_yolo else "OFF"
-            yolo_color = (0, 255, 0) if do_yolo else (0, 255, 255)
-            cv2.putText(frame_copy, f"YOLO: {yolo_status}", 
-                       (FIXED_WINDOW_WIDTH - 150, 55),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, yolo_color, 2)
-            
-            # 3. OCR Queue
-            cv2.putText(frame_copy, f"OCRQ: {crop_queue.qsize()}/12", 
-                       (FIXED_WINDOW_WIDTH - 150, 75),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            
-            # 4. ვაგონის ნომერი
-            cv2.putText(frame_copy, current_ocr_text, 
-                       (20, 40),
-                       cv2.FONT_HERSHEY_DUPLEX, 1.8, (0, 255, 255), 3)
-            
-            # 5. რაოდენობა
-            cv2.putText(frame_copy, f"Wagons: {next_id-1}", 
-                       (FIXED_WINDOW_WIDTH - 300, FIXED_WINDOW_HEIGHT - 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            
-            # 6. Confidence
-            conf_text = f"Conf: {best_conf_local:.1f}"
-            conf_color = (0, 255, 0) if best_conf_local >= 0.9 else (0, 255, 255) if best_conf_local >= 0.5 else (0, 120, 255)
-            cv2.putText(frame_copy, conf_text, 
-                       (20, FIXED_WINDOW_HEIGHT - 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, conf_color, 2)
-            
-            cv2.imshow(window_name, frame_copy)
-            
-            # Keys
-            key = cv2.waitKey(1) & 0xFF  # 2 → 1 (სწრაფი)
-            if key == ord('q'):
-                break
-            
-            # 🔥 **FFmpeg მხოლოდ ყოველ 2 ფრეიმზე**
-            if do_ffmpeg and ffmpeg_process and ffmpeg_process.stdin and not ffmpeg_process.stdin.closed:
-                try:
-                    orig_frame = frame.copy()
-                    cv2.rectangle(orig_frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                    
-                    # **FFmpeg-ში ძველი BOX-ები** (YOLO არ ვაკეთებთ)
-                    for gx1, gy1, gx2, gy2, conf, wagon_id in cached_boxes:
-                        color = (0, 255, 0) if conf >= MIN_CONFIDENCE_OCR else (0, 120, 255)
-                        cv2.rectangle(orig_frame, (gx1, gy1), (gx2, gy2), color, 4)
-                        cv2.putText(orig_frame, f"W{conf:.1f}", (gx1, gy1 - 10),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-                    
-                    # OCR text
-                    with ocr_lock:
-                        cv2.putText(orig_frame, last_ocr_text, (20, 90),
-                                   cv2.FONT_HERSHEY_DUPLEX, 2.5, (0, 255, 255), 5)
-                    
-                    cv2.putText(orig_frame, f"FPS: {current_fps:.1f}", (width - 150, 40),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    
-                    ffmpeg_process.stdin.write(orig_frame.tobytes())
-                    ffmpeg_process.stdin.flush()
-                except:
-                    pass
-                    
-    finally:
-        cleanup()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, lambda sig, frame: cleanup())
-    main_loop()
+    main()
