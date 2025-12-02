@@ -26,8 +26,8 @@ UNIQUE_WAGON_JSON = "unique_wagons.json"
 ALL_OCR_JSON = "all_ocr_results.json"
 
 MIN_CONFIDENCE_OCR = 0.6
-TCP_SERVER_IP = "127.0.0.1"
-TCP_SERVER_PORT = 5000
+TCP_SERVER_IP = "192.168.1.81"
+TCP_SERVER_PORT = 45000
 TCP_RECONNECT_DELAY = 5
 WAGON_NUMBER_LENGTH = 8
 
@@ -166,32 +166,31 @@ def reset_session():
     print("სესია გადატვირთულია! (START) — ყველაფერი გასუფთავდა.")
 
 def handle_stop_command():
-    print("STOP ბრძანება მიღებული — ვაგზავნით შედეგებს სერვერზე...")
+    print("STOP მიღებულია — ვაგზავნით სუფთა JSON-ს...")
     save_logs()
 
-    # მომზადება სუფთა JSON-ის გაგზავნისთვის
-    wagons_list = wagons_data["wagons"]  # [{"id": 1, "number": "76724913"}, ...]
-
-    if not wagons_list:
-        print("არ არის ვაგონები გასაგზავნად.")
+    if not wagons_data["wagons"]:
+        print("ცარიელი სია — არაფერი გასაგზავნი")
         return
 
-    json_data = json.dumps(wagons_list, ensure_ascii=False)
-    data_bytes = json_data.encode('utf-8')
+    if tcp_socket is None:
+        print("TCP კავშირი არ არის!")
+        return
 
     try:
-        send_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        send_sock.settimeout(10)
-        send_sock.connect((TCP_SERVER_IP, TCP_SERVER_PORT))
-        
-        # გაგზავნა: 8-ნიშნა სიგრძე + JSON
-        length_prefix = f"{len(data_bytes):08d}".encode('utf-8')
-        send_sock.sendall(length_prefix + data_bytes)
-        
-        print(f"JSON წარმატებით გაიგზავნა სერვერზე! ({len(wagons_list)} ვაგონი, {len(data_bytes)} ბაიტი)")
-        send_sock.close()
+        # ლამაზი JSON ფორმატით (indent=2)
+        json_str = json.dumps(wagons_data["wagons"], ensure_ascii=False, indent=2)
+
+        # გაგზავნა მხოლოდ JSON + \n ბოლოს
+        tcp_socket.sendall((json_str + "\n").encode('utf-8'))
+
+        print(f"გაიგზავნა {len(wagons_data['wagons'])} ვაგონი:")
+        print(json_str)
+
+        reset_session()
+
     except Exception as e:
-        print(f"JSON-ის გაგზავნა ვერ მოხერხდა: {e}")
+        print(f"შეცდომა გაგზავნისას: {e}")
 
 # ================================
 # მთავარი ციკლი
