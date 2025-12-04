@@ -26,7 +26,7 @@ UNIQUE_WAGON_JSON = "unique_wagons.json"
 ALL_OCR_JSON = "all_ocr_results.json"
 
 MIN_CONFIDENCE_OCR = 0.6
-TCP_SERVER_IP = "192.168.1.81"
+TCP_SERVER_IP = "127.0.0.1"
 TCP_SERVER_PORT = 45002
 TCP_RECONNECT_DELAY = 5
 WAGON_NUMBER_LENGTH = 8
@@ -88,8 +88,8 @@ def save_logs():
 # OCR Worker
 # ================================
 def ocr_worker():
-    processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
-    trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
+    processor = TrOCRProcessor.from_pretrained("microsoft/trocr-large-printed")
+    trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-large-printed")
     trocr_model.eval()
 
     while running:

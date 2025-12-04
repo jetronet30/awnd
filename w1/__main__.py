@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WAGON TRACKER — INDUSTRIAL FINAL v15.0
+WAGON TRACKER — INDUSTRIAL FINAL v15.4
+START/STOP + სრულიად სტაბილური + აღარანაირი SyntaxError/UnboundLocalError
 100% PyInstaller თავსებადი | 2025
 """
 
@@ -23,6 +24,7 @@ import socket
 from threading import Thread, Lock
 from pathlib import Path
 
+
 # ==================== PyInstaller ====================
 def resource_path(relative_path):
     try:
@@ -30,6 +32,7 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
 
 # ==================== LOGGING ====================
 log_dir = Path("logs")
@@ -43,6 +46,7 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger("WAGON_TRACKER")
+
 
 # ==================== CONFIG ====================
 MODEL_PATH = resource_path("best.pt")
@@ -60,10 +64,19 @@ CAMERAS = [
     {"name": "cam 2", "url": "rtsp://admin:admin@192.168.1.11:554", "roi": {"x1": 0.05, "y1": 0.05, "x2": 0.95, "y2": 0.95}},
 ]
 
-# ==================== OCR ====================
-log.info("TrOCR-base ჩატვირთვა...")
-ocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
-ocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
+
+# ==================== GLOBAL FLAGS ====================
+running = True
+detection_enabled = False
+detection_lock = Lock()
+cameras = []
+tcp_socket = None
+
+
+# ==================== OCR SETUP ====================
+log.info("TrOCR მოდელის ჩატვირთვა...")
+ocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-large-printed")
+ocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-large-printed")
 ocr_model.eval()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 ocr_model.to(device)
@@ -71,9 +84,7 @@ torch.set_num_threads(8)
 log.info(f"TrOCR მზადაა: {device}")
 
 ocr_queue = queue.Queue(maxsize=6)
-running = True
-cameras = []
-tcp_socket = None
+
 
 class Camera:
     def __init__(self, cfg, idx):
@@ -93,7 +104,7 @@ class Camera:
         self.frame_lock = Lock()
         self.data_lock = Lock()
 
-        log.info(f"[{self.name}] YOLO ჩატვირთვა...")
+        log.info(f"[{self.name}] YOLO მოდელის ჩატვირთვა...")
         self.model = YOLO(MODEL_PATH)
         self.model.fuse()
 
@@ -123,6 +134,14 @@ class Camera:
                     self.latest_frame = frame.copy()
 
                 fc += 1
+
+                with detection_lock:
+                    currently_enabled = detection_enabled
+
+                if not currently_enabled:
+                    time.sleep(0.01)
+                    continue
+
                 if fc % DETECTION_EVERY_N_FRAME != 0:
                     time.sleep(0.001)
                     continue
@@ -149,13 +168,11 @@ class Camera:
                 with self.data_lock:
                     current = set()
                     for box in results.boxes:
-                        if box.id is None: continue
+                        if box.id is None:
+                            continue
                         tid = int(box.id.item())
                         current.add(tid)
-                        try:
-                            conf = float(box.conf.item())
-                        except:
-                            conf = 0.0
+                        conf = float(box.conf.item()) if hasattr(box.conf, 'item') else 0.0
                         bx1, by1, bx2, by2 = map(int, box.xyxy[0])
                         gx1, gy1 = x1 + bx1, y1 + by1
                         gx2, gy2 = x1 + bx2, y1 + by2
@@ -172,9 +189,14 @@ class Camera:
                             self.last_boxes.pop(t, None)
                             self.last_seen.pop(t, None)
 
-                if (best_tid and best_conf > 0.75 and 
-                    best_tid not in self.wagon_numbers and 
+                if (best_tid and best_conf > 0.75 and
+                    best_tid not in self.wagon_numbers and
                     time.time() - last_ocr > OCR_COOLDOWN):
+
+                    with detection_lock:
+                        if not detection_enabled:
+                            continue
+
                     last_ocr = time.time()
                     x1, y1, x2, y2 = self.last_boxes[best_tid]
                     if x2 - x1 > 120 and y2 - y1 > 45:
@@ -189,6 +211,7 @@ class Camera:
             except Exception as e:
                 log.error(f"[{self.name}] Run შეცდომა: {e}")
                 time.sleep(0.1)
+
 
 def ocr_worker():
     log.info("OCR Worker გაშვებული")
@@ -218,8 +241,9 @@ def ocr_worker():
         except Exception as e:
             log.error(f"OCR შეცდომა: {e}")
 
+
 def tcp_client():
-    global tcp_socket, running
+    global tcp_socket, running, detection_enabled
     while running:
         try:
             tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -227,17 +251,29 @@ def tcp_client():
             log.info(f"TCP დაკავშირებული: {TCP_SERVER_IP}:{TCP_SERVER_PORT}")
             while running:
                 data = tcp_socket.recv(1024)
-                if not data: break
-                cmd = data.decode().strip().upper()
+                if not data:
+                    break
+                cmd = data.decode('utf-8').strip().upper()
+
                 if cmd == "START":
+                    with detection_lock:
+                        detection_enabled = True
                     reset_all()
+                    log.info(">>> DETECTION STARTED <<<")
+
                 elif cmd == "STOP":
+                    with detection_lock:
+                        detection_enabled = False
                     handle_stop()
+                    log.info(">>> DETECTION STOPPED <<<")
+
         except Exception as e:
             log.error(f"TCP კავშირი გაწყდა: {e}")
-            if tcp_socket: tcp_socket.close()
+            if tcp_socket:
+                tcp_socket.close()
             tcp_socket = None
             time.sleep(RECONNECT_DELAY)
+
 
 def reset_all():
     for cam in cameras:
@@ -249,7 +285,8 @@ def reset_all():
             cam.next_display_id = 1
             cam.track_to_display.clear()
             cam.wagons_list.clear()
-    log.info("START — ყველა გასუფთავდა")
+    log.info("ყველა გასუფთავდა (START)")
+
 
 def handle_stop():
     all_wagons = []
@@ -259,6 +296,7 @@ def handle_stop():
                 entry = w.copy()
                 entry.update({"channel": cam.idx, "camera": cam.name, "timestamp": datetime.now().isoformat()})
                 all_wagons.append(entry)
+
     if all_wagons:
         try:
             with open(UNIQUE_WAGON_JSON, "w", encoding="utf-8") as f:
@@ -267,35 +305,48 @@ def handle_stop():
         except Exception as e:
             log.error(f"JSON შენახვა ვერ მოხერხდა: {e}")
 
-        if tcp_socket:
+        if tcp_socket and hasattr(tcp_socket, 'fileno') and tcp_socket.fileno() != -1:
             try:
                 msg = json.dumps(all_wagons, ensure_ascii=False) + "\n"
                 tcp_socket.sendall(msg.encode("utf-8"))
                 log.info(f"TCP: გაიგზავნა {len(all_wagons)} ვაგონი")
             except Exception as e:
                 log.error(f"TCP გაგზავნა ვერ მოხერხდა: {e}")
+
     reset_all()
+
 
 def display():
     if HEADLESS:
-        while running: time.sleep(1)
+        while True:
+            if not globals().get('running', False):
+                break
+            time.sleep(1)
         return
 
     while True:
-        # გლობალური running — ახლა სწორად ვამოწმებთ!
+        # ასე არასდროს იქნება SyntaxError ან UnboundLocalError
         if not globals().get('running', False):
             break
 
         canvas = np.zeros((900, 1940, 3), np.uint8)
         canvas[:] = (30, 30, 50)
-        cv2.putText(canvas, "WAGON TRACKER — 100% PyInstaller Ready", (20, 60),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.4, (0,255,0), 3)
+        cv2.putText(canvas, "WAGON TRACKER v15.5 — სრულიად სტაბილური", (20, 60),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.4, (0, 255, 0), 3)
+
+        with detection_lock:
+            is_running = detection_enabled
+        status = "მუშაობს" if is_running else "მზადაა (ელოდება START)"
+        color = (0, 255, 0) if is_running else (0, 140, 255)
+        cv2.putText(canvas, f"სტატუსი: {status}", (20, 100), cv2.FONT_HERSHEY_DUPLEX, 1.4, color, 3)
+
         total = sum(len(cam.wagons_list) for cam in cameras)
-        cv2.putText(canvas, f"TOTAL: {total}", (20, 100), cv2.FONT_HERSHEY_DUPLEX, 1.4, (0,255,255), 3)
+        cv2.putText(canvas, f"ჯამში: {total}", (20, 140), cv2.FONT_HERSHEY_DUPLEX, 1.4, (0, 255, 255), 3)
 
         for i, cam in enumerate(cameras):
             with cam.frame_lock:
-                if cam.latest_frame is None: continue
+                if cam.latest_frame is None:
+                    continue
                 frame = cv2.resize(cam.latest_frame, (860, 480))
             x0 = 80 + i * 940
             canvas[200:680, x0:x0+860] = frame
@@ -305,23 +356,24 @@ def display():
             cv2.rectangle(canvas,
                 (x0 + int(w * r["x1"] * 860/w), 200 + int(h * r["y1"] * 480/h)),
                 (x0 + int(w * r["x2"] * 860/w), 200 + int(h * r["y2"] * 480/h)),
-                (0,0,255), 6)
+                (0, 0, 255), 6)
 
             cv2.putText(canvas, f"{cam.name} | {len(cam.wagons_list)}", (x0+20, 180),
-                        cv2.FONT_HERSHEY_DUPLEX, 1.2, (0,255,0), 3)
+                        cv2.FONT_HERSHEY_DUPLEX, 1.2, (0, 255, 0), 3)
 
-            with cam.data_lock:
-                for tid, (x1,y1,x2,y2) in cam.last_boxes.items():
-                    sx = 860 / w
-                    sy = 480 / h
-                    color = (0,255,0) if tid in cam.wagon_numbers else (0,165,255)
-                    label = f"{cam.track_to_display.get(tid,'?')}→{cam.wagon_numbers.get(tid,'?')}"
-                    cv2.rectangle(canvas, (x0 + int(x1*sx), 200 + int(y1*sy)),
-                                  (x0 + int(x2*sx), 200 + int(y2*sy)), color, 4)
-                    cv2.putText(canvas, label, (x0 + int(x1*sx), 200 + int(y1*sy) - 10),
-                                cv2.FONT_HERSHEY_DUPLEX, 0.9, color, 2)
+            if detection_enabled:
+                with cam.data_lock:
+                    for tid, (x1, y1, x2, y2) in cam.last_boxes.items():
+                        sx = 860 / w
+                        sy = 480 / h
+                        color = (0, 255, 0) if tid in cam.wagon_numbers else (0, 165, 255)
+                        label = f"{cam.track_to_display.get(tid, '?')}→{cam.wagon_numbers.get(tid, '?')}"
+                        cv2.rectangle(canvas, (x0 + int(x1*sx), 200 + int(y1*sy)),
+                                      (x0 + int(x2*sx), 200 + int(y2*sy)), color, 4)
+                        cv2.putText(canvas, label, (x0 + int(x1*sx), 200 + int(y1*sy) - 10),
+                                    cv2.FONT_HERSHEY_DUPLEX, 0.9, color, 2)
 
-        cv2.imshow("WAGON TRACKER — FINAL", canvas)
+        cv2.imshow("WAGON TRACKER — FINAL v15.5", canvas)
         key = cv2.waitKey(1)
         if key == ord('q') or key == 27:
             globals()['running'] = False
@@ -329,12 +381,14 @@ def display():
 
     cv2.destroyAllWindows()
 
+
 def main():
     global running, cameras
-    signal.signal(signal.SIGINT, lambda s,f: globals().__setitem__("running", False))
-    signal.signal(signal.SIGTERM, lambda s,f: globals().__setitem__("running", False))
 
-    log.info("=== WAGON TRACKER INDUSTRIAL STARTED ===")
+    signal.signal(signal.SIGINT, lambda s, f: globals().__setitem__("running", False))
+    signal.signal(signal.SIGTERM, lambda s, f: globals().__setitem__("running", False))
+
+    log.info("=== WAGON TRACKER INDUSTRIAL STARTED (v15.4) ===")
 
     Thread(target=ocr_worker, daemon=True).start()
     Thread(target=tcp_client, daemon=True).start()
@@ -343,11 +397,12 @@ def main():
 
     cameras = [Camera(cfg, i) for i, cfg in enumerate(CAMERAS)]
 
-    log.info("სისტემა 100%-ით მუშაობს! PyInstaller თავსებადი!")
+    log.info("სისტემა მზადაა! გაგზავნე TCP-ით: START ან STOP")
     while running:
         time.sleep(1)
 
     log.info("=== სისტემა გაჩერდა ===")
+
 
 if __name__ == "__main__":
     main()
